@@ -1,5 +1,7 @@
 # Core Framework
 streamlit>=1.38.0
+protobuf==3.20.2
+
 
 # LangChain
 langchain>=0.3.0
