@@ -1,0 +1,7 @@
+[server]
+# Disable local module watching to prevent warning/error tracebacks when scanning libraries like transformers
+watchLocalModules = false
+
+[client]
+# Keep the UI clean by hiding development toolbar options
+toolbarMode = "minimal"
