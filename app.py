@@ -8,8 +8,11 @@ Features:
     - Interactive chatbot for resume Q&A
 """
 
-import streamlit as st
 import os
+# Force pure-python implementation of Protobuf to bypass Streamlit Cloud C-extension conflicts
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+import streamlit as st
 import time
 from dotenv import load_dotenv
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
