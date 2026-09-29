@@ -21,6 +21,13 @@ from src.resume_parser import extract_text_from_pdf, clean_resume_text, chunk_te
 from src.embeddings import get_embeddings, create_vector_store, get_retriever
 from src.jd_matcher import match_resume_with_jd, extract_match_score
 from src.chatbot import get_chat_response
+from src.career_path_optimizer import (
+    extract_skills_from_text, compare_algorithms, SKILL_DATABASE,
+    hill_climbing_optimizer, a_star_optimizer, calculate_match_score as calc_skill_match
+)
+from src.job_route_optimizer import (
+    solve_tsp, get_city_coordinates, CITY_COORDINATES
+)
 from prompts.chatbot_prompt import CHATBOT_GREETING
 
 # ─── Load Environment Variables ───────────────────────────────────────────────
@@ -172,6 +179,72 @@ st.markdown("""
         height: 1px;
         background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
         margin: 1.5rem 0;
+    }
+
+    /* ── Algorithm Card ── */
+    .algo-card {
+        background: linear-gradient(135deg, #1a1a2e, #16213e);
+        padding: 1.2rem 1.5rem;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        margin: 0.8rem 0;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+    }
+
+    .algo-card h4 {
+        color: #a78bfa;
+        font-size: 1rem;
+        font-weight: 600;
+        margin: 0 0 0.5rem 0;
+    }
+
+    .algo-card p {
+        color: rgba(255, 255, 255, 0.65);
+        font-size: 0.88rem;
+        margin: 0;
+        line-height: 1.5;
+    }
+
+    /* ── Path Step ── */
+    .path-step {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        padding: 0.6rem 1rem;
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 8px;
+        margin: 0.3rem 0;
+        border-left: 3px solid #6366f1;
+    }
+
+    .path-step.prereq {
+        border-left-color: #f59e0b;
+    }
+
+    /* ── Route Card ── */
+    .route-segment {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 0.8rem;
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 8px;
+        margin: 0.2rem 0;
+        font-size: 0.9rem;
+        color: rgba(255, 255, 255, 0.8);
+    }
+
+    .comparison-box {
+        background: linear-gradient(135deg, #0f172a, #1e1b4b);
+        padding: 1.5rem;
+        border-radius: 12px;
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        margin: 1rem 0;
+    }
+
+    .comparison-box h4 {
+        color: #818cf8;
+        margin: 0 0 0.8rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -457,7 +530,7 @@ def render_matching_tab():
     # Display results if they exist in session state
     if st.session_state.jd_analysis_results:
         st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
-        st.markdown("### 🏆 Candidate Leaderboard")
+        st.markdown("### 🏆 Resume Leaderboard")
 
         # Build leaderboard list sorted by score descending
         leaderboard = []
@@ -567,6 +640,568 @@ def render_chatbot_tab():
                     st.error(error_msg)
 
 
+# ─── Tab 4: Career Path Optimizer (Hill Climbing + A*) ───────────────────────
+def render_career_path_tab():
+    """Render the Career Path Optimizer tab using Hill Climbing and A* algorithms."""
+    st.markdown("### 🧗 Career Path Optimizer")
+    st.markdown(
+        "Uses **Hill Climbing** (greedy) and **A\\* Search** (optimal) algorithms "
+        "to find the best skill learning path from your current resume to a target job role."
+    )
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # ── Algorithm Explanation ──
+    with st.expander("📖 How It Works — State Space Search", expanded=False):
+        st.markdown("""
+**State Space Search** models the career path as a search problem:
+
+| Concept | Mapping |
+|---------|---------|
+| **State** | Set of skills the candidate currently has |
+| **Goal State** | Set of skills required for the target job |
+| **Operators** | Learning a new skill (if prerequisites are met) |
+| **Cost** | Estimated days to learn each skill |
+| **Heuristic** | Sum of effort for remaining missing skills |
+
+**Hill Climbing** 🏔️
+- Greedy algorithm — always picks the skill with the best *value* (improvement/effort)
+- Fast but may get stuck at local maxima
+- Cannot backtrack once a choice is made
+
+**A\\* Search** ⭐
+- Uses `f(n) = g(n) + h(n)` where g = effort spent, h = estimated remaining effort
+- Guarantees the **optimal** (minimum total effort) path
+- Explores more nodes but finds the best solution
+        """)
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # ── Step 1: Get Current Skills ──
+    st.markdown("#### Step 1: Your Current Skills")
+
+    current_skills = set()
+    auto_detected = set()
+
+    if st.session_state.resume_uploaded and st.session_state.resumes:
+        # Auto-detect skills from resume
+        for name, data in st.session_state.resumes.items():
+            detected = extract_skills_from_text(data["text"])
+            auto_detected.update(detected)
+
+        if auto_detected:
+            st.success(f"✅ Auto-detected **{len(auto_detected)}** skills from your resume(s)")
+
+            # Show detected skills in a nice layout
+            cols = st.columns(4)
+            for idx, skill in enumerate(sorted(auto_detected)):
+                cat = SKILL_DATABASE.get(skill, {}).get("category", "Other")
+                cols[idx % 4].markdown(f"- 🔹 **{skill.title()}** `{cat}`")
+    else:
+        st.info("💡 Upload a resume in the **📄 Resume Upload** tab to auto-detect skills, "
+                "or manually enter them below.")
+
+    # Manual skill entry
+    manual_input = st.text_input(
+        "Add/modify skills (comma-separated)",
+        value=", ".join(sorted(auto_detected)) if auto_detected else "",
+        placeholder="python, java, html, css, react, sql, git...",
+        help="Edit the auto-detected skills or enter your own",
+        key="career_current_skills"
+    )
+
+    if manual_input.strip():
+        current_skills = {s.strip().lower() for s in manual_input.split(",") if s.strip()}
+    else:
+        current_skills = auto_detected
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # ── Step 2: Define Target Skills ──
+    st.markdown("#### Step 2: Target Job Skills")
+    st.markdown("Enter the skills required for your target job role.")
+
+    # Preset role templates
+    role_presets = {
+        "Custom (Enter manually)": "",
+        "Full Stack Developer": "python, javascript, html, css, react, node.js, sql, git, docker, rest api, mongodb",
+        "Data Scientist": "python, statistics, machine learning, deep learning, pandas, numpy, scikit-learn, sql, data visualization, tensorflow",
+        "ML Engineer": "python, machine learning, deep learning, tensorflow, pytorch, docker, aws, git, mlops, data structures, algorithms",
+        "Frontend Developer": "html, css, javascript, typescript, react, next.js, git, rest api",
+        "Backend Developer": "python, django, rest api, sql, postgresql, docker, git, linux, redis",
+        "DevOps Engineer": "linux, docker, kubernetes, aws, terraform, ci/cd, git, jenkins, ansible, python",
+        "Mobile Developer": "java, kotlin, android, flutter, git, rest api, firebase",
+        "Cloud Architect": "aws, azure, gcp, docker, kubernetes, terraform, networking, linux, system design, ci/cd",
+        "Cybersecurity Analyst": "networking, linux, cybersecurity, ethical hacking, python, sql",
+        "AI/NLP Engineer": "python, machine learning, deep learning, nlp, pytorch, langchain, prompt engineering, rag, generative ai",
+    }
+
+    selected_preset = st.selectbox(
+        "Choose a target role template (or enter custom)",
+        options=list(role_presets.keys()),
+        key="career_role_preset"
+    )
+
+    default_target = role_presets.get(selected_preset, "")
+
+    jd_input_text = st.text_area(
+        "Paste Job Description to extract target skills",
+        value=default_target,
+        placeholder="Paste JD here or manually type comma-separated skills...",
+        height=150,
+        key="career_target_jd"
+    )
+
+    target_skills = set()
+    if jd_input_text.strip():
+        # First, try to see if it's just a comma-separated list
+        if "," in jd_input_text and len(jd_input_text.split("\n")) < 3:
+            target_skills = {s.strip().lower() for s in jd_input_text.split(",") if s.strip()}
+        else:
+            # If it looks like a full JD, extract skills using the NLP matcher
+            target_skills = extract_skills_from_text(jd_input_text)
+            
+            if target_skills:
+                st.success(f"✅ Auto-detected **{len(target_skills)}** skills from the Job Description")
+                cols = st.columns(4)
+                for idx, skill in enumerate(sorted(target_skills)):
+                    cat = SKILL_DATABASE.get(skill, {}).get("category", "Other")
+                    cols[idx % 4].markdown(f"- 🎯 **{skill.title()}** `{cat}`")
+            else:
+                st.warning("Could not auto-detect any known skills from the provided text.")
+
+    # Validate skills
+    unknown_current = current_skills - set(SKILL_DATABASE.keys())
+    unknown_target = target_skills - set(SKILL_DATABASE.keys())
+
+    if unknown_current:
+        st.warning(f"⚠️ Unknown skills in your set (will be ignored): {', '.join(unknown_current)}")
+        current_skills -= unknown_current
+
+    if unknown_target:
+        st.warning(f"⚠️ Unknown skills in target (will be ignored): {', '.join(unknown_target)}")
+        target_skills -= unknown_target
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # ── Step 3: Run Algorithms ──
+    if st.button("🚀 Find Optimal Learning Path", use_container_width=True, type="primary",
+                 key="career_run_btn"):
+        if not current_skills:
+            st.warning("⚠️ Please enter your current skills.")
+            return
+        if not target_skills:
+            st.warning("⚠️ Please enter target job skills.")
+            return
+
+        missing = target_skills - current_skills
+        if not missing:
+            st.success("🎉 You already have ALL the target skills! No learning path needed.")
+            return
+
+        st.markdown(f"**Current Skills:** {len(current_skills)} | "
+                    f"**Target Skills:** {len(target_skills)} | "
+                    f"**Missing:** {len(missing)}")
+
+        with st.spinner("🧠 Running Hill Climbing and A* algorithms..."):
+            results = compare_algorithms(current_skills, target_skills)
+            st.session_state["career_results"] = results
+
+    # ── Display Results ──
+    if "career_results" in st.session_state and st.session_state["career_results"]:
+        results = st.session_state["career_results"]
+        hill = results["hill_climbing"]
+        astar = results["a_star"]
+        comparison = results["comparison"]
+
+        st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+        # ── Comparison Summary ──
+        st.markdown("### 📊 Algorithm Comparison")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Hill Climbing Effort", f"{hill['total_effort_days']} days",
+                      delta=f"{hill['total_skills_to_learn']} skills")
+        with col2:
+            st.metric("A* Optimal Effort", f"{astar['total_effort_days']} days",
+                      delta=f"{astar['total_skills_to_learn']} skills")
+        with col3:
+            saved = comparison['effort_saved_by_astar']
+            st.metric("A* Saves", f"{saved} days",
+                      delta=f"{comparison['astar_efficiency_gain_percent']}% more efficient",
+                      delta_color="normal")
+
+        st.markdown(f"""
+        <div class="comparison-box">
+            <h4>🔍 Key Insight</h4>
+            <p style="color: rgba(255,255,255,0.75); margin: 0;">
+                {comparison['summary']}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Side-by-side paths ──
+        st.markdown("### 🛤️ Learning Paths")
+
+        tab_hc, tab_astar = st.tabs(["🏔️ Hill Climbing Path", "⭐ A* Optimal Path"])
+
+        for tab, result, label in [(tab_hc, hill, "Hill Climbing"), (tab_astar, astar, "A*")]:
+            with tab:
+                if not result["path"]:
+                    st.warning(f"⚠️ {label} could not find a complete path.")
+                    continue
+
+                st.markdown(f"**Score: {result['initial_score']}% → {result['final_score']}%** | "
+                            f"**Total Effort: {result['total_effort_days']} days** | "
+                            f"**Skills to Learn: {result['total_skills_to_learn']}**")
+
+                st.progress(result["final_score"] / 100)
+
+                # Show learning path as a table
+                path_data = []
+                for step in result["path"]:
+                    step_num = step.get("step", path_data.__len__() + 1)
+                    skill_type = "📋 Prerequisite" if step["is_prerequisite"] else "🎯 Target Skill"
+                    path_data.append({
+                        "Step": step_num,
+                        "Skill": step["skill"].title(),
+                        "Category": step["category"],
+                        "Effort (days)": step["effort_days"],
+                        "Score After": f"{step['score_after']}%",
+                        "Type": skill_type
+                    })
+
+                st.table(path_data)
+
+                # Algorithm trace
+                with st.expander(f"🔬 {label} Algorithm Trace", expanded=False):
+                    for t in result["trace"]:
+                        st.markdown(f"**Step {t['step']}** — {t['action']}")
+                        st.caption(t["description"])
+                        st.markdown("---")
+
+
+# ─── Tab 5: Job Route Optimizer (TSP) ────────────────────────────────────────
+def render_tsp_tab():
+    """Render the TSP Job Route Optimizer tab."""
+    st.markdown("### 🗺️ Job Route Optimizer")
+    st.markdown(
+        "Uses the **Traveling Salesman Problem (TSP)** to find the optimal order "
+        "for visiting job interview locations, minimizing total travel distance."
+    )
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # ── Algorithm Explanation ──
+    with st.expander("📖 How It Works — Traveling Salesman Problem", expanded=False):
+        st.markdown("""
+**The Traveling Salesman Problem (TSP)** is a classic NP-hard optimization problem:
+
+> *Given a list of cities and the distances between them, find the shortest possible
+> route that visits each city exactly once and returns to the starting city.*
+
+**Algorithms Used:**
+
+| Algorithm | Type | Complexity | When Used |
+|-----------|------|------------|-----------|
+| **Brute Force** | Exact (Optimal) | O(n!) | n ≤ 8 cities |
+| **DP Held-Karp** | Exact (Optimal) | O(n² × 2ⁿ) | 8 < n ≤ 15 cities |
+| **Nearest Neighbor** | Greedy Heuristic | O(n²) | All sizes |
+
+**Mapping to Job Search:**
+- **Cities** = Job interview locations
+- **Distance** = Travel distance between cities (Haversine formula)
+- **Tour** = Optimal order to attend all interviews
+        """)
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # ── Job Input ──
+    st.markdown("#### Enter Job Opportunities")
+    st.markdown("Add job locations you're considering. We'll find the optimal travel route.")
+
+    # Available cities for reference
+    available_cities = sorted(CITY_COORDINATES.keys())
+
+    num_jobs = st.slider("Number of job locations", min_value=3, max_value=10, value=5,
+                         key="tsp_num_jobs")
+
+    st.markdown("**Available cities:** " + ", ".join(
+        [c.title() for c in available_cities[:20]]) + ", ...")
+
+    # ── Home Location ──
+    st.markdown("#### Starting Point (Your Home)")
+    home_location = st.text_input("Home Location (City / Area / Address)", value="RS Puram, Coimbatore", key="tsp_home")
+
+    st.markdown("#### Job Interview Locations")
+
+    jobs = []
+    
+    if home_location.strip():
+        coord = get_city_coordinates(home_location)
+        if coord:
+            jobs.append({
+                "company": "🏠 Home",
+                "city": home_location.strip(),
+                "role": "Start/End Point"
+            })
+        else:
+            st.warning(f"⚠️ Could not find coordinates for '{home_location}'. Route will not start here.")
+
+    cols_per_row = 2
+
+    for i in range(num_jobs):
+        row = i // cols_per_row
+        col_idx = i % cols_per_row
+
+        if col_idx == 0:
+            cols = st.columns(cols_per_row)
+
+        with cols[col_idx]:
+            st.markdown(f"**Job {i + 1}**")
+            company = st.text_input(f"Company", value=f"Company {i + 1}",
+                                    key=f"tsp_company_{i}")
+            city_defaults = [
+                "electronic city, bangalore", 
+                "tidel park, chennai", 
+                "saravanampatti, coimbatore", 
+                "hitec city, hyderabad",
+                "whitefield, bangalore",
+                "omr, chennai"
+            ]
+            city = st.text_input(f"City / Area", value=city_defaults[i % len(city_defaults)] if i < 10 else "",
+                                 key=f"tsp_city_{i}")
+            role = st.text_input(f"Role", value="Software Engineer",
+                                 key=f"tsp_role_{i}")
+
+            if city.strip():
+                coord = get_city_coordinates(city)
+                if coord:
+                    jobs.append({
+                        "company": company.strip() or f"Company {i + 1}",
+                        "city": city.strip(),
+                        "role": role.strip() or "Engineer",
+                    })
+                else:
+                    st.caption(f"⚠️ '{city}' not in database. Try another city.")
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    if st.button("🚀 Optimize Route", use_container_width=True, type="primary",
+                 key="tsp_run_btn"):
+        if len(jobs) < 3:
+            st.warning("⚠️ Please enter at least 3 valid job locations.")
+            return
+
+        with st.spinner("🧠 Solving TSP with multiple algorithms..."):
+            tsp_results = solve_tsp(jobs)
+            st.session_state["tsp_results"] = tsp_results
+
+    # ── Display Results ──
+    if "tsp_results" in st.session_state and st.session_state["tsp_results"]:
+        tsp_results = st.session_state["tsp_results"]
+
+        if "error" in tsp_results:
+            st.error(tsp_results["error"])
+            return
+
+        st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+        st.markdown("### 📊 TSP Results")
+
+        n = tsp_results["num_jobs"]
+        nn_result = tsp_results["nearest_neighbor"]
+        exact_result = tsp_results.get("exact")
+        comparison = tsp_results["comparison"]
+
+        # ── Metrics ──
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Cities", n)
+        with col2:
+            st.metric("Nearest Neighbor Distance", f"{nn_result['total_distance_km']} km")
+        with col3:
+            if exact_result:
+                st.metric(
+                    f"{tsp_results.get('exact_method', 'Exact')} Distance",
+                    f"{exact_result['total_distance_km']} km"
+                )
+            else:
+                st.metric("Exact Solution", "Skipped (too many cities)")
+
+        # ── Comparison ──
+        if exact_result:
+            gap = comparison.get("optimality_gap_percent", 0)
+            st.markdown(f"""
+            <div class="comparison-box">
+                <h4>🔍 Algorithm Comparison</h4>
+                <p style="color: rgba(255,255,255,0.75); margin: 0;">
+                    {comparison.get('summary', '')}
+                    <br><br>
+                    The Nearest Neighbor heuristic produced a tour that is
+                    <strong>{gap}%</strong> longer than the optimal route.
+                    {"This is quite close to optimal! ✅" if gap < 15 else "There's room for improvement — exact algorithms find better routes."}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Route Visualization ──
+        st.markdown("### 🛣️ Optimal Route")
+
+        if exact_result:
+            tab_exact, tab_nn = st.tabs([
+                f"🏆 {tsp_results.get('exact_method', 'Exact')} (Optimal)",
+                "🔄 Nearest Neighbor (Heuristic)"
+            ])
+        else:
+            tab_nn = st.container()
+            tab_exact = None
+
+        for tab, result, label in [(tab_exact, exact_result, "Exact"),
+                                    (tab_nn, nn_result, "Nearest Neighbor")]:
+            if tab is None or result is None:
+                continue
+
+            with tab:
+                st.markdown(f"**Total Distance: {result['total_distance_km']} km**")
+                st.markdown(f"**Route:** {' → '.join(result['route_names'])} → 🔄 Start")
+
+                # Route segments table
+                if "segments" in result:
+                    seg_data = []
+                    for idx, seg in enumerate(result["segments"], 1):
+                        seg_data.append({
+                            "Leg": idx,
+                            "From": seg["from"],
+                            "To": seg["to"],
+                            "Distance (km)": seg["distance_km"]
+                        })
+                    st.table(seg_data)
+
+                # Show on map — Interactive Folium with animated route path
+                coords = tsp_results.get("coordinates", [])
+                if coords:
+                    import folium
+                    from folium.plugins import AntPath
+                    from streamlit_folium import st_folium
+
+                    route_order = result.get("route", [])
+                    job_names = tsp_results.get("job_names", [])
+                    segments = result.get("segments", [])
+
+                    # Build ordered route coordinates (lat, lon)
+                    route_coords = []
+                    for city_idx in route_order:
+                        lat, lon = coords[city_idx]
+                        if lat != 0 or lon != 0:
+                            route_coords.append((lat, lon))
+
+                    if route_coords:
+                        st.markdown("**🗺️ Interactive Route Map**")
+
+                        # Calculate map center
+                        avg_lat = sum(c[0] for c in route_coords) / len(route_coords)
+                        avg_lon = sum(c[1] for c in route_coords) / len(route_coords)
+
+                        # Create Folium map
+                        m = folium.Map(
+                            location=[avg_lat, avg_lon],
+                            zoom_start=7,
+                            tiles="OpenStreetMap",
+                        )
+
+                        # Color palette for route segments
+                        segment_colors = [
+                            "#3b82f6", "#ef4444", "#10b981", "#f59e0b",
+                            "#8b5cf6", "#ec4899", "#06b6d4", "#f97316",
+                            "#14b8a6", "#6366f1",
+                        ]
+
+                        # Add numbered markers for each stop
+                        for stop_idx, city_idx in enumerate(route_order):
+                            lat, lon = coords[city_idx]
+                            if lat == 0 and lon == 0:
+                                continue
+                            name = job_names[city_idx] if city_idx < len(job_names) else f"Stop {stop_idx}"
+
+                            # Home marker (first stop) gets green; others blue
+                            is_home = name.startswith("🏠")
+                            icon_color = "green" if is_home else "blue"
+                            icon_glyph = "home" if is_home else "briefcase"
+
+                            # Build popup with segment distance
+                            popup_text = f"<b>#{stop_idx + 1} — {name}</b>"
+                            if stop_idx < len(segments):
+                                seg = segments[stop_idx]
+                                popup_text += f"<br>→ Next: {seg['to']}<br>Distance: {seg['distance_km']} km"
+
+                            folium.Marker(
+                                location=[lat, lon],
+                                tooltip=f"#{stop_idx + 1} {name}",
+                                popup=folium.Popup(popup_text, max_width=250),
+                                icon=folium.Icon(
+                                    color=icon_color,
+                                    icon=icon_glyph,
+                                    prefix="fa",
+                                ),
+                            ).add_to(m)
+
+                        # Draw route segments as individual colored lines
+                        for seg_idx in range(len(route_coords)):
+                            from_coord = route_coords[seg_idx]
+                            to_coord = route_coords[(seg_idx + 1) % len(route_coords)]
+                            color = segment_colors[seg_idx % len(segment_colors)]
+
+                            # Solid polyline for the segment
+                            folium.PolyLine(
+                                locations=[list(from_coord), list(to_coord)],
+                                color=color,
+                                weight=4,
+                                opacity=0.8,
+                                tooltip=f"Leg {seg_idx + 1}",
+                            ).add_to(m)
+
+                        # Animated ant-path overlay for the full route (including return)
+                        full_path = [list(c) for c in route_coords]
+                        full_path.append(list(route_coords[0]))  # close the loop
+                        AntPath(
+                            locations=full_path,
+                            dash_array=[10, 20],
+                            delay=1000,
+                            weight=3,
+                            color="#1e40af",
+                            pulse_color="#60a5fa",
+                            opacity=0.6,
+                        ).add_to(m)
+
+                        # Fit map bounds to show all markers
+                        sw = [min(c[0] for c in route_coords) - 0.05,
+                              min(c[1] for c in route_coords) - 0.05]
+                        ne = [max(c[0] for c in route_coords) + 0.05,
+                              max(c[1] for c in route_coords) + 0.05]
+                        m.fit_bounds([sw, ne])
+
+                        st_folium(m, use_container_width=True, height=500, returned_objects=[])
+
+                # Algorithm trace
+                with st.expander(f"🔬 {label} Algorithm Trace", expanded=False):
+                    for t in result.get("trace", []):
+                        desc = t.get("description", "")
+                        action = t.get("action", "")
+                        st.markdown(f"**Step {t.get('step', '?')}** — {action}")
+                        st.caption(desc)
+                        st.markdown("---")
+
+        # Distance Matrix
+        with st.expander("📏 Distance Matrix (km)", expanded=False):
+            import pandas as pd
+            dm = tsp_results["distance_matrix"]
+            names = tsp_results["job_names"]
+            short_names = [n.split("(")[0].strip() for n in names]
+            df = pd.DataFrame(dm, index=short_names, columns=short_names)
+            st.dataframe(df.style.format("{:.1f}"))
+
+
 # ─── Main Application ────────────────────────────────────────────────────────
 def main():
     """Main application entry point."""
@@ -586,10 +1221,12 @@ def main():
     """, unsafe_allow_html=True)
 
     # Main tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📄 Resume Upload",
         "🎯 JD Matching",
         "💬 Chatbot",
+        "🧗 Career Path",
+        "🗺️ Job Route"
     ])
 
     with tab1:
@@ -600,6 +1237,12 @@ def main():
 
     with tab3:
         render_chatbot_tab()
+
+    with tab4:
+        render_career_path_tab()
+
+    with tab5:
+        render_tsp_tab()
 
 
 if __name__ == "__main__":
