@@ -230,13 +230,24 @@ resumeanalyzer/
 
 The app is designed to easily swap LLM providers. Edit `app.py`'s `initialize_llm()` function:
 
-### Use Google Gemini (Free)
+### Use OpenRouter (Primary & Recommended — Zero Rate-Limit Bottlenecks)
+```bash
+pip install langchain-openai
+```
+Add to your `.env` file (or enter directly in the Streamlit sidebar):
+```env
+OPENROUTER_API_KEY=sk-or-v1-your_openrouter_api_key_here
+OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free
+```
+Supports free models (`meta-llama/llama-3.3-70b-instruct:free`, `google/gemini-2.0-flash-exp:free`, `mistralai/mistral-7b-instruct:free`) and top paid models (`deepseek/deepseek-chat`, `qwen/qwen-2.5-72b-instruct`).
+
+### Use Google Gemini (Fallback)
 ```bash
 pip install langchain-google-genai
 ```
 ```python
 from langchain_google_genai import ChatGoogleGenerativeAI
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key="YOUR_KEY")
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key="YOUR_KEY")
 ```
 
 ### Use Ollama (Fully Local, No API Key)

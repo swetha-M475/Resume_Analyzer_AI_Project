@@ -17,7 +17,7 @@ import time
 from dotenv import load_dotenv
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
-from src.resume_parser import extract_text_from_pdf, clean_resume_text, chunk_text
+from src.resume_parser import extract_text_from_file, clean_resume_text, chunk_text
 from src.embeddings import get_embeddings, create_vector_store, get_retriever
 from src.jd_matcher import match_resume_with_jd, extract_match_score
 from src.chatbot import get_chat_response
@@ -263,6 +263,9 @@ def init_session_state():
         "resume_uploaded": False,
         "file_names": [],           # List of uploaded file names
         "jd_analysis_results": {},  # {file_name: {"score": score, "analysis": analysis}}
+        "openrouter_api_key": os.getenv("OPENROUTER_API_KEY", ""),
+        "openrouter_model": os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"),
+        "llm_provider_name": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -274,23 +277,80 @@ init_session_state()
 
 # ─── LLM Initialization ──────────────────────────────────────────────────────
 @st.cache_resource
-def initialize_llm():
-    """Initialize the HuggingFace LLM (cached across reruns)."""
-    hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    if not hf_token or hf_token == "hf_your_token_here":
-        return None
+def get_cached_llm(provider: str, api_key: str, model_name: str):
+    """Create and cache LLM instance based on provider and credentials."""
+    if provider == "openrouter":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model_name or "nvidia/nemotron-3.5-lightning:free",
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            temperature=0.3,
+            default_headers={
+                "HTTP-Referer": "http://localhost:8501",
+                "X-Title": "Resume Analyzer AI",
+            },
+        )
+    elif provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=model_name or "gemini-1.5-flash",
+            google_api_key=api_key,
+            temperature=0.3,
+        )
+    elif provider == "huggingface":
+        llm_endpoint = HuggingFaceEndpoint(
+            repo_id="meta-llama/Llama-3.1-8B-Instruct",
+            huggingfacehub_api_token=api_key,
+            task="conversational",
+            max_new_tokens=1024,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.1,
+        )
+        return ChatHuggingFace(llm=llm_endpoint)
+    return None
 
-    llm_endpoint = HuggingFaceEndpoint(
-        repo_id="meta-llama/Llama-3.1-8B-Instruct",
-        huggingfacehub_api_token=hf_token,
-        task="conversational",
-        max_new_tokens=1024,
-        temperature=0.3,
-        top_p=0.9,
-        repetition_penalty=1.1,
-    )
-    llm = ChatHuggingFace(llm=llm_endpoint)
-    return llm
+
+def initialize_llm():
+    """Initialize LLM prioritizing OpenRouter, then Gemini (1.5 Flash), then HuggingFace."""
+    # 1. OpenRouter (Primary & Recommended - eliminates rate limit bottlenecks)
+    openrouter_key = st.session_state.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY", "")
+    openrouter_key = openrouter_key.strip() if openrouter_key else ""
+    openrouter_model = st.session_state.get("openrouter_model") or os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
+    openrouter_model = openrouter_model.strip() if openrouter_model else "nvidia/nemotron-3.5-lightning:free"
+
+    if openrouter_key and openrouter_key != "sk-or-v1-your_openrouter_api_key_here":
+        try:
+            llm = get_cached_llm("openrouter", openrouter_key, openrouter_model)
+            model_short = openrouter_model.split("/")[-1].replace(":free", " (free)")
+            st.session_state["llm_provider_name"] = f"OpenRouter [{model_short}]"
+            return llm
+        except Exception as e:
+            st.warning(f"Could not initialize OpenRouter LLM: {e}")
+
+    # 2. Gemini fallback (using stable 1.5-flash)
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key and gemini_key.strip() and gemini_key != "your_gemini_api_key_here":
+        try:
+            llm = get_cached_llm("gemini", gemini_key.strip(), "gemini-1.5-flash")
+            st.session_state["llm_provider_name"] = "Google Gemini (1.5 Flash)"
+            return llm
+        except Exception as e:
+            st.warning(f"Could not initialize Gemini LLM: {e}")
+
+    # 3. HuggingFace fallback
+    hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    if hf_token and hf_token.strip() and hf_token != "hf_your_token_here":
+        try:
+            llm = get_cached_llm("huggingface", hf_token.strip(), "Llama-3.1-8B")
+            st.session_state["llm_provider_name"] = "HuggingFace (Llama-3.1-8B)"
+            return llm
+        except Exception as e:
+            st.warning(f"Could not initialize HuggingFace LLM: {e}")
+
+    st.session_state["llm_provider_name"] = None
+    return None
 
 
 @st.cache_resource
@@ -301,7 +361,7 @@ def initialize_embeddings():
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 def render_sidebar():
-    """Render the sidebar with app info and status."""
+    """Render the sidebar with app info, model configuration, and status."""
     with st.sidebar:
         st.markdown("## 📄 Resume Analyzer AI")
         st.markdown("---")
@@ -310,11 +370,56 @@ def render_sidebar():
         st.markdown("### ⚙️ System Status")
 
         # LLM Status
+        provider_name = st.session_state.get("llm_provider_name")
         if st.session_state.llm:
-            st.markdown('<span class="status-badge badge-success">✅ LLM Connected</span>', unsafe_allow_html=True)
+            badge_label = f"✅ LLM: {provider_name}" if provider_name else "✅ LLM Connected"
+            st.markdown(f'<span class="status-badge badge-success">{badge_label}</span>', unsafe_allow_html=True)
         else:
             st.markdown('<span class="status-badge badge-warning">⚠️ LLM Not Connected</span>', unsafe_allow_html=True)
-            st.caption("Add your HuggingFace token to `.env`")
+            st.caption("Provide an OpenRouter API key below or in `.env`")
+
+        # OpenRouter Model Settings in Sidebar
+        with st.expander("🔑 AI Model Settings (OpenRouter)", expanded=(st.session_state.llm is None)):
+            st.markdown(
+                "Use OpenRouter to bypass rate limits. "
+                "Get your key at [openrouter.ai/keys](https://openrouter.ai/keys)."
+            )
+            key_input = st.text_input(
+                "OpenRouter API Key",
+                type="password",
+                value=st.session_state.get("openrouter_api_key", ""),
+                placeholder="sk-or-v1-...",
+                help="Enter your OpenRouter API key here or define OPENROUTER_API_KEY in .env"
+            )
+
+            model_options = [
+                "nvidia/nemotron-3.5-lightning:free",
+                "google/gemma-4-26b-a4b-it:free",
+                "deepseek/deepseek-chat",
+                "meta-llama/llama-3.3-70b-instruct",
+                "Custom...",
+            ]
+
+            curr_model = st.session_state.get("openrouter_model", "nvidia/nemotron-3.5-lightning:free")
+            selected_idx = model_options.index(curr_model) if curr_model in model_options else len(model_options) - 1
+
+            chosen_model = st.selectbox(
+                "Model",
+                options=model_options,
+                index=selected_idx,
+                help="Select free or paid OpenRouter model"
+            )
+            if chosen_model == "Custom...":
+                custom_model = st.text_input("Custom Model ID", value=curr_model if curr_model not in model_options else "")
+                final_model = custom_model.strip() if custom_model.strip() else "meta-llama/llama-3.3-70b-instruct:free"
+            else:
+                final_model = chosen_model
+
+            if st.button("💾 Apply & Connect", use_container_width=True, type="primary"):
+                st.session_state.openrouter_api_key = key_input.strip()
+                st.session_state.openrouter_model = final_model.strip()
+                st.session_state.llm = initialize_llm()
+                st.rerun()
 
         st.markdown("")
 
@@ -343,7 +448,8 @@ def render_sidebar():
         This app uses:
         - **LangChain** for orchestration
         - **ChromaDB** for vector storage
-        - **HuggingFace** for embeddings & LLM
+        - **OpenRouter / HuggingFace** for LLM
+        - **HuggingFace** for embeddings
         - **Streamlit** for the UI
         """)
 
@@ -361,16 +467,16 @@ def render_sidebar():
 def render_upload_tab():
     """Render the Resume Upload tab."""
     st.markdown("### 📤 Upload Your Resumes")
-    st.markdown("Upload one or multiple PDF resumes to get started. The text will be extracted, chunked, and stored in a shared vector database.")
+    st.markdown("Upload one or multiple resumes (PDF, DOCX, or TXT) to get started. The text will be extracted, chunked, and stored in a shared vector database.")
 
     st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "Choose PDF resumes",
-        type=["pdf"],
+        "Choose resumes (PDF, DOCX, TXT)",
+        type=["pdf", "docx", "txt"],
         key="resume_uploader",
         accept_multiple_files=True,
-        help="Upload one or multiple resumes in PDF format",
+        help="Upload one or multiple resumes in PDF, DOCX, or TXT format",
     )
 
     if uploaded_files:
@@ -393,7 +499,7 @@ def render_upload_tab():
                 with st.spinner(f"🔄 Processing {uploaded_file.name}..."):
                     try:
                         # Extract & clean text
-                        raw_text = extract_text_from_pdf(uploaded_file)
+                        raw_text = extract_text_from_file(uploaded_file)
                         cleaned_text = clean_resume_text(raw_text)
 
                         # Chunk text (include source filename as metadata)
@@ -481,7 +587,7 @@ def render_matching_tab():
         return
 
     if not st.session_state.llm:
-        st.error("❌ LLM not connected. Please add your HuggingFace token to the `.env` file and restart.")
+        st.error("❌ LLM not connected. Please enter your OpenRouter API key in the sidebar settings or `.env` file.")
         return
 
     # JD Input
@@ -600,7 +706,7 @@ def render_chatbot_tab():
         return
 
     if not st.session_state.llm:
-        st.error("❌ LLM not connected. Please add your HuggingFace token to the `.env` file and restart.")
+        st.error("❌ LLM not connected. Please enter your OpenRouter API key in the sidebar settings or `.env` file.")
         return
 
     # Display chat history

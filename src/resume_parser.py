@@ -1,12 +1,16 @@
 """
 Resume Parser Module
-Handles PDF text extraction and text chunking for vector storage.
+Handles multi-format resume text extraction (PDF, DOCX, TXT) and text chunking for vector storage.
 """
 
 import re
 from io import BytesIO
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+
+# ─── Supported File Extensions ────────────────────────────────────────────────
+SUPPORTED_EXTENSIONS = ["pdf", "docx", "txt"]
 
 
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -35,12 +39,114 @@ def extract_text_from_pdf(uploaded_file) -> str:
         raise ValueError(f"Failed to extract text from PDF: {str(e)}")
 
 
+def extract_text_from_docx(uploaded_file) -> str:
+    """
+    Extract text content from an uploaded DOCX file.
+    
+    Args:
+        uploaded_file: Streamlit UploadedFile object (DOCX)
+    
+    Returns:
+        Extracted text as a single string
+    """
+    try:
+        from docx import Document
+
+        doc = Document(BytesIO(uploaded_file.read()))
+        text_parts = []
+
+        # Extract paragraph text
+        for para in doc.paragraphs:
+            if para.text.strip():
+                text_parts.append(para.text)
+
+        # Extract text from tables (resumes often use tables for layout)
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    if cell_text:
+                        row_text.append(cell_text)
+                if row_text:
+                    text_parts.append(" | ".join(row_text))
+
+        full_text = "\n".join(text_parts)
+        return full_text
+
+    except ImportError:
+        raise ValueError(
+            "python-docx is required for DOCX support. "
+            "Install it with: pip install python-docx"
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
+
+
+def extract_text_from_txt(uploaded_file) -> str:
+    """
+    Extract text content from an uploaded TXT file.
+    
+    Args:
+        uploaded_file: Streamlit UploadedFile object (TXT)
+    
+    Returns:
+        Extracted text as a single string
+    """
+    try:
+        raw_bytes = uploaded_file.read()
+
+        # Try UTF-8 first, fall back to latin-1 (which never fails)
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return raw_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    except Exception as e:
+        raise ValueError(f"Failed to read TXT file: {str(e)}")
+
+
+def extract_text_from_file(uploaded_file) -> str:
+    """
+    Unified text extraction dispatcher — detects file type by extension
+    and routes to the appropriate extractor.
+    
+    Supported formats: PDF, DOCX, TXT
+    
+    Args:
+        uploaded_file: Streamlit UploadedFile object
+    
+    Returns:
+        Extracted text as a single string
+    
+    Raises:
+        ValueError: If file type is unsupported or extraction fails
+    """
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".pdf"):
+        return extract_text_from_pdf(uploaded_file)
+    elif filename.endswith(".docx"):
+        return extract_text_from_docx(uploaded_file)
+    elif filename.endswith(".txt"):
+        return extract_text_from_txt(uploaded_file)
+    else:
+        supported = ", ".join(SUPPORTED_EXTENSIONS)
+        raise ValueError(
+            f"Unsupported file type: '{filename.split('.')[-1]}'. "
+            f"Supported formats: {supported}"
+        )
+
+
 def clean_resume_text(text: str) -> str:
     """
     Clean extracted resume text by removing artifacts and normalizing whitespace.
     
     Args:
-        text: Raw extracted text from PDF
+        text: Raw extracted text from a resume file
     
     Returns:
         Cleaned text
